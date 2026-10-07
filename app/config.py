@@ -19,7 +19,8 @@ class Settings:
     redis_url: str
     search_radius_m: int
     max_candidates: int
-    min_votes_threshold: int  # m, in the Bayesian formula
+    min_votes_threshold: int  # m: reviews needed to fully trust a rating
+    prior_rating: float       # C, in the Bayesian formula
     weight_rating: float      # w1
     weight_distance: float    # w2
     cache_ttl_seconds: int
@@ -45,7 +46,8 @@ def get_settings() -> Settings:
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         search_radius_m=int(os.getenv("SEARCH_RADIUS_M", "1500")),
         max_candidates=int(os.getenv("MAX_CANDIDATES", "20")),
-        min_votes_threshold=int(os.getenv("MIN_VOTES_THRESHOLD", "50")),
+        min_votes_threshold=int(os.getenv("MIN_VOTES_THRESHOLD", "200")),
+        prior_rating=float(os.getenv("PRIOR_RATING", "4.0")),
         weight_rating=float(os.getenv("WEIGHT_RATING", "0.65")),
         weight_distance=float(os.getenv("WEIGHT_DISTANCE", "0.35")),
         cache_ttl_seconds=int(os.getenv("CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60))),

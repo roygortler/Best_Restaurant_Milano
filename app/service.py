@@ -56,6 +56,8 @@ def find_best_restaurants(lat: float, lon: float, limit: int = 10) -> list[Ranke
         user_lat=lat,
         user_lon=lon,
         min_votes_threshold=settings.min_votes_threshold,
+        prior_rating=settings.prior_rating,
+        max_distance_km=settings.search_radius_m / 1000,
         weight_rating=settings.weight_rating,
         weight_distance=settings.weight_distance,
     )

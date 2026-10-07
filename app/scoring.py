@@ -5,17 +5,19 @@ rating, user_rating_count, lat, lon) plus the user's live GPS coordinates,
 and ranks them by a weighted blend of:
 
   1. A Bayesian-adjusted rating, which pulls low-review-count restaurants
-     toward the candidate set's mean - so a brand-new place with one
-     5-star review doesn't outrank an established one with 800 reviews
-     at 4.6.
+     toward a fixed prior rating - so a brand-new place with one 5-star
+     review doesn't outrank an established one with 800 reviews at 4.6.
+     Past MIN_VOTES_THRESHOLD reviews the rating is taken at face value.
   2. A log-distance score - closer is better, but with diminishing
      sensitivity as distance grows (the gap between 200m and 400m matters
-     far more than the gap between 2km and 2.2km).
+     far more than the gap between 1.2km and 1.4km).
 
-Both components are min-max normalized to [0, 1] across the candidate set
-before being combined - they live on completely different numeric scales
-(ratings ~1-5, distance scores unbounded above), so combining them with
-weights only makes sense once they're on the same footing.
+Both components are scaled to [0, 1] against FIXED bounds (the 1-5 star
+scale, and 0 to the search radius) rather than against the min/max of the
+current candidate set. Scaling against the candidate set made a result's
+score depend on who else happened to be in the list: with two candidates
+every component became exactly 0 or 1, so the weights alone decided the
+winner no matter how large or small the real differences were.
 
 Everything here operates on plain dicts/dataclasses, so it's unit testable
 with zero mocking - see tests/test_scoring.py.
@@ -23,12 +25,14 @@ with zero mocking - see tests/test_scoring.py.
 import math
 from dataclasses import dataclass
 
-DEFAULT_MIN_VOTES_THRESHOLD = 50  # m, in the Bayesian formula
+DEFAULT_MIN_VOTES_THRESHOLD = 200 # m: reviews needed to fully trust a rating
+DEFAULT_PRIOR_RATING = 4.0        # C, in the Bayesian formula
+DEFAULT_MAX_DISTANCE_KM = 1.5     # distances at or beyond this score 0
 DEFAULT_WEIGHT_RATING = 0.65      # w1
 DEFAULT_WEIGHT_DISTANCE = 0.35    # w2
 
 _EARTH_RADIUS_KM = 6371.0
-_MIN_DISTANCE_KM = 0.001  # 1 meter floor - see distance_score() docstring
+_MIN_STARS, _MAX_STARS = 1.0, 5.0
 
 
 @dataclass(frozen=True)
@@ -54,39 +58,38 @@ def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) ->
 
 
 def bayesian_rating(rating: float | None, review_count: int, global_mean: float, m: int) -> float:
-    """(v / (v+m)) * R + (m / (v+m)) * C
+    """trust * R + (1 - trust) * C, where trust = min(v / m, 1)
+
+    Trust in the restaurant's own rating grows linearly with its review
+    count until it reaches m, and is total from then on - 200 reviews and
+    2000 reviews are treated as equally reliable. (The classic v/(v+m)
+    form never fully trusts anyone, so 600 reviews would still beat 200.)
 
     A restaurant with zero reviews has no meaningful R - Google typically
-    omits `rating` entirely for it - but v=0 already makes R's coefficient
-    zero, so we return the global mean directly rather than multiplying a
-    possibly-None rating by zero.
+    omits `rating` entirely for it - so we return C directly rather than
+    multiplying a possibly-None rating by zero.
     """
     if review_count <= 0 or rating is None:
         return global_mean
-    v = review_count
-    return (v / (v + m)) * rating + (m / (v + m)) * global_mean
+    trust = min(review_count / m, 1.0)
+    return trust * rating + (1 - trust) * global_mean
 
 
-def distance_score(distance_km: float) -> float:
-    """1 / log(1 + distance_km)
+def rating_score(bayesian: float) -> float:
+    """Map a 1-5 star rating onto [0, 1]."""
+    return (bayesian - _MIN_STARS) / (_MAX_STARS - _MIN_STARS)
 
-    log(1 + 0) = 0, which would divide by zero for a restaurant at the
-    user's exact coordinates. GPS is rarely accurate below a few meters
-    anyway, so distances under 1m are floored to 1m - "you're standing in
-    it" still yields a large-but-finite score instead of crashing.
+
+def distance_score(distance_km: float, max_distance_km: float) -> float:
+    """1 - log(1 + d) / log(1 + max_d), clamped to [0, 1].
+
+    1.0 when standing in the restaurant, 0.0 at the edge of the search
+    radius. The log curve makes the score drop fastest close to the user,
+    so nearby differences matter more than far-away ones.
     """
-    return 1 / math.log(1 + max(distance_km, _MIN_DISTANCE_KM))
-
-
-def _min_max_normalize(values: list[float]) -> list[float]:
-    """Scale values to [0, 1]. If every value is identical there's no basis
-    to rank them apart - return 1.0 for all rather than 0.0, so a tied
-    component still counts fully instead of vanishing from the final score.
-    """
-    lo, hi = min(values), max(values)
-    if hi == lo:
-        return [1.0 for _ in values]
-    return [(v - lo) / (hi - lo) for v in values]
+    if distance_km >= max_distance_km:
+        return 0.0
+    return 1 - math.log(1 + distance_km) / math.log(1 + max_distance_km)
 
 
 def rank_restaurants(
@@ -94,6 +97,8 @@ def rank_restaurants(
     user_lat: float,
     user_lon: float,
     min_votes_threshold: int = DEFAULT_MIN_VOTES_THRESHOLD,
+    prior_rating: float = DEFAULT_PRIOR_RATING,
+    max_distance_km: float = DEFAULT_MAX_DISTANCE_KM,
     weight_rating: float = DEFAULT_WEIGHT_RATING,
     weight_distance: float = DEFAULT_WEIGHT_DISTANCE,
 ) -> list[RankedRestaurant]:
@@ -105,24 +110,20 @@ def rank_restaurants(
     if abs(weight_sum - 1.0) > 1e-9:
         raise ValueError(f"weight_rating + weight_distance must equal 1.0, got {weight_sum}")
 
-    # C: computed only from candidates that actually have a rating - a
-    # zero-review place has no rating to contribute to "the mean rating of
-    # restaurants around here".
-    rated_values = [c["rating"] for c in candidates if c.get("rating") is not None]
-    global_mean = sum(rated_values) / len(rated_values) if rated_values else 0.0
-
+    # C is a fixed prior, not the mean of this candidate set. With few
+    # candidates, the set's mean is dominated by the very places being
+    # judged - a lone 5.0 drags the mean up and barely gets discounted.
     bayesian_scores = [
-        bayesian_rating(c.get("rating"), c["user_rating_count"], global_mean, min_votes_threshold)
+        bayesian_rating(c.get("rating"), c["user_rating_count"], prior_rating, min_votes_threshold)
         for c in candidates
     ]
     distances_km = [
         haversine_distance_km(user_lat, user_lon, c["lat"], c["lon"])
         for c in candidates
     ]
-    distance_scores = [distance_score(d) for d in distances_km]
 
-    normalized_ratings = _min_max_normalize(bayesian_scores)
-    normalized_distances = _min_max_normalize(distance_scores)
+    normalized_ratings = [rating_score(b) for b in bayesian_scores]
+    normalized_distances = [distance_score(d, max_distance_km) for d in distances_km]
 
     ranked = [
         RankedRestaurant(

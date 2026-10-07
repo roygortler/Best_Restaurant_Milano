@@ -1,6 +1,4 @@
 """Tests for the scoring pipeline - pure functions, no mocking needed at all."""
-import math
-
 import pytest
 
 from app import scoring
@@ -17,47 +15,77 @@ def test_haversine_distance_km_one_degree_latitude_is_about_111km():
 
 
 def test_bayesian_rating_pulls_low_review_count_toward_global_mean():
-    # 1 review of 5.0 stars, against a neighborhood mean of 4.0 - should land
-    # much closer to 4.0 than to the raw 5.0.
-    result = scoring.bayesian_rating(rating=5.0, review_count=1, global_mean=4.0, m=50)
-    assert result == pytest.approx(4.0196, abs=0.001)
-    assert result < 4.1
+    # 2 reviews of 5.0 stars, against a prior of 4.0 - 1% trust, so it
+    # should land almost exactly on 4.0.
+    result = scoring.bayesian_rating(rating=5.0, review_count=2, global_mean=4.0, m=200)
+    assert result == pytest.approx(4.01)
 
 
-def test_bayesian_rating_trusts_high_review_count():
-    # 1000 reviews should barely be pulled toward the mean at all.
-    result = scoring.bayesian_rating(rating=4.8, review_count=1000, global_mean=4.0, m=50)
-    assert result == pytest.approx(4.762, abs=0.001)
-    assert result > 4.7
+def test_bayesian_rating_trust_grows_linearly_below_threshold():
+    # 100 of 200 reviews -> half trust -> halfway between 4.0 and 4.8.
+    result = scoring.bayesian_rating(rating=4.8, review_count=100, global_mean=4.0, m=200)
+    assert result == pytest.approx(4.4)
+
+
+def test_bayesian_rating_fully_trusts_at_threshold():
+    result = scoring.bayesian_rating(rating=4.8, review_count=200, global_mean=4.0, m=200)
+    assert result == pytest.approx(4.8)
+
+
+def test_bayesian_rating_review_count_stops_mattering_past_threshold():
+    at_threshold = scoring.bayesian_rating(rating=4.5, review_count=200, global_mean=4.0, m=200)
+    way_past = scoring.bayesian_rating(rating=4.5, review_count=5000, global_mean=4.0, m=200)
+    assert at_threshold == way_past == pytest.approx(4.5)
 
 
 def test_bayesian_rating_zero_reviews_returns_global_mean_without_crashing():
     # Google omits `rating` for places with no reviews - rating=None must
     # not blow up even though it's still technically multiplied by zero.
-    result = scoring.bayesian_rating(rating=None, review_count=0, global_mean=4.1, m=50)
+    result = scoring.bayesian_rating(rating=None, review_count=0, global_mean=4.1, m=200)
     assert result == 4.1
 
 
 def test_distance_score_decreases_as_distance_increases():
-    close = scoring.distance_score(0.2)
-    far = scoring.distance_score(2.0)
+    close = scoring.distance_score(0.2, max_distance_km=1.5)
+    far = scoring.distance_score(1.2, max_distance_km=1.5)
     assert close > far
 
 
-def test_distance_score_does_not_crash_at_zero_distance():
-    # log(1 + 0) == 0 would divide by zero without the 1m floor.
-    score = scoring.distance_score(0.0)
-    assert math.isfinite(score)
-    assert score > 0
+def test_distance_score_is_one_at_zero_distance():
+    assert scoring.distance_score(0.0, max_distance_km=1.5) == 1.0
 
 
-def test_min_max_normalize_basic_range():
-    assert scoring._min_max_normalize([1.0, 2.0, 3.0]) == [0.0, 0.5, 1.0]
+def test_distance_score_is_zero_at_and_beyond_max_distance():
+    assert scoring.distance_score(1.5, max_distance_km=1.5) == 0.0
+    assert scoring.distance_score(3.0, max_distance_km=1.5) == 0.0
 
 
-def test_min_max_normalize_identical_values_returns_all_ones():
-    # No spread means no basis to rank apart - full credit, not zero.
-    assert scoring._min_max_normalize([4.2, 4.2, 4.2]) == [1.0, 1.0, 1.0]
+def test_distance_score_drops_faster_close_to_the_user():
+    # Log curve: the first 200m costs more than 200m further out.
+    near_drop = scoring.distance_score(0.0, 1.5) - scoring.distance_score(0.2, 1.5)
+    far_drop = scoring.distance_score(1.0, 1.5) - scoring.distance_score(1.2, 1.5)
+    assert near_drop > far_drop
+
+
+def test_rating_score_maps_star_scale_onto_zero_to_one():
+    assert scoring.rating_score(1.0) == 0.0
+    assert scoring.rating_score(3.0) == 0.5
+    assert scoring.rating_score(5.0) == 1.0
+
+
+def test_rank_restaurants_score_does_not_depend_on_other_candidates():
+    # Regression: scores used to be min-max normalized across the candidate
+    # set, so adding an unrelated place changed everyone else's score.
+    place = {"place_id": "a", "name": "A", "rating": 4.3, "user_rating_count": 200,
+             "lat": 45.4650, "lon": 9.1910}
+    other = {"place_id": "b", "name": "B", "rating": 3.1, "user_rating_count": 40,
+             "lat": 45.4700, "lon": 9.2000}
+
+    alone = scoring.rank_restaurants([place], user_lat=45.4642, user_lon=9.1900)
+    together = scoring.rank_restaurants([place, other], user_lat=45.4642, user_lon=9.1900)
+
+    score_together = next(r for r in together if r.place_id == "a").final_score
+    assert alone[0].final_score == pytest.approx(score_together)
 
 
 def test_rank_restaurants_empty_candidates_returns_empty_list():

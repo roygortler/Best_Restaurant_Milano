@@ -5,7 +5,7 @@ single API call refreshes both the restaurant list and every place's rating
 data for that whole neighborhood at once - see cache.py's module docstring
 for why areas are cached this way.
 
-New areas are only ever added by live requests (app/pipeline.py, on a cache
+New areas are only ever added by live requests (app/service.py, on a cache
 miss); this script just keeps areas that are already known from going stale.
 
 Intended to run on a schedule (cron / Windows Task Scheduler), e.g. weekly:
