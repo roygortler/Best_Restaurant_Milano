@@ -12,7 +12,6 @@ import pytest
 
 from app import places_client
 from app.config import get_settings
-from app.scoring import haversine_distance_km
 
 
 class _FakeResponse:
@@ -86,18 +85,53 @@ def test_search_restaurants_builds_text_search_request(monkeypatch):
     assert body["strictTypeFiltering"] is True
     assert body["minRating"] == 4.2
     assert body["pageSize"] == 20
+    assert body["rankPreference"] == "DISTANCE"
     assert "pageToken" not in body
 
 
-def test_bounding_box_extends_radius_in_each_direction():
-    box = places_client._bounding_box(45.4642, 9.1900, 1500)
+def test_search_restaurants_ranks_by_distance_from_circle_center(monkeypatch):
+    # Google only honors DISTANCE ranking with a center point; with a
+    # rectangle restriction it silently fell back to relevance order.
+    captured = _install_pages(monkeypatch, [{"places": []}])
 
-    north = haversine_distance_km(45.4642, 9.1900, box["high"]["latitude"], 9.1900)
-    east = haversine_distance_km(45.4642, 9.1900, 45.4642, box["high"]["longitude"])
-    assert north == pytest.approx(1.5, abs=0.01)
-    assert east == pytest.approx(1.5, abs=0.01)
-    assert box["low"]["latitude"] < 45.4642 < box["high"]["latitude"]
-    assert box["low"]["longitude"] < 9.1900 < box["high"]["longitude"]
+    places_client.search_restaurants(lat=45.4642, lon=9.1900, radius_m=1500)
+
+    body = captured[0]["body"]
+    assert body["rankPreference"] == "DISTANCE"
+    assert body["locationBias"]["circle"] == {
+        "center": {"latitude": 45.4642, "longitude": 9.1900},
+        "radius": 1500.0,
+    }
+    assert "locationRestriction" not in body
+
+
+def _raw_place_at(place_id: str, meters_north: float) -> dict:
+    place = _raw_place(place_id)
+    place["location"] = {"latitude": 45.4642 + meters_north / 111_320, "longitude": 9.1900}
+    return place
+
+
+def test_search_restaurants_drops_places_beyond_radius(monkeypatch):
+    # The circle is only a bias, so Google can return places past it.
+    _install_pages(monkeypatch, [{"places": [_raw_place_at("near", 900), _raw_place_at("far", 1100)]}])
+
+    results = places_client.search_restaurants(lat=45.4642, lon=9.1900, radius_m=1000)
+
+    assert [r["place_id"] for r in results] == ["near"]
+
+
+def test_search_restaurants_stops_paging_once_past_radius(monkeypatch):
+    # Results are closest-first, so once a page reaches past the radius,
+    # every later page would be too - don't pay for it.
+    captured = _install_pages(monkeypatch, [
+        {"places": [_raw_place_at("a", 100), _raw_place_at("b", 1200)], "nextPageToken": "t1"},
+        {"places": [_raw_place_at("c", 1300)]},
+    ])
+
+    results = places_client.search_restaurants(lat=45.4642, lon=9.1900, radius_m=1000, max_results=60)
+
+    assert len(captured) == 1
+    assert [r["place_id"] for r in results] == ["a"]
 
 
 def test_search_restaurants_follows_page_tokens(monkeypatch):

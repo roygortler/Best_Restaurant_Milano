@@ -25,11 +25,13 @@ class Settings:
     prior_rating: float       # C, in the Bayesian formula
     weight_rating: float      # w1
     weight_distance: float    # w2
-    # Used instead of the three above when an area is dense (the search
-    # hit max_candidates) - see service._scoring_params.
+    # Used instead of the normal values when an area is dense (the search
+    # hit max_candidates) - see service._area_profile.
     dense_min_votes_threshold: int
     dense_weight_rating: float
     dense_weight_distance: float
+    dense_min_rating: float       # stricter than min_rating; applied after fetching
+    dense_max_distance_m: int     # candidates farther than this are dropped
     cache_ttl_seconds: int
 
 
@@ -62,5 +64,7 @@ def get_settings() -> Settings:
         dense_min_votes_threshold=int(os.getenv("DENSE_MIN_VOTES_THRESHOLD", "500")),
         dense_weight_rating=float(os.getenv("DENSE_WEIGHT_RATING", "0.8")),
         dense_weight_distance=float(os.getenv("DENSE_WEIGHT_DISTANCE", "0.2")),
+        dense_min_rating=float(os.getenv("DENSE_MIN_RATING", "4.3")),
+        dense_max_distance_m=int(os.getenv("DENSE_MAX_DISTANCE_M", "1000")),
         cache_ttl_seconds=int(os.getenv("CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60))),
     )

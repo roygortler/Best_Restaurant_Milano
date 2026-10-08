@@ -27,7 +27,7 @@ import redis
 
 from app import cache, db, places_client
 from app.config import get_settings
-from app.scoring import RankedRestaurant, rank_restaurants
+from app.scoring import RankedRestaurant, haversine_distance_km, rank_restaurants
 
 logger = logging.getLogger(__name__)
 
@@ -103,29 +103,40 @@ def fetch_and_store_area(lat: float, lon: float) -> list[dict]:
     return places
 
 
-def _scoring_params(candidates: list[dict]) -> dict:
-    """Pick the normal or the dense scoring profile for this area.
+def _area_profile(candidates: list[dict], lat: float, lon: float) -> tuple[list[dict], dict]:
+    """Pick the normal or the dense profile: which candidates to rank, and how.
 
     An area is dense when the search filled every slot (max_candidates):
     Google had more good restaurants than we could take. There, the user
-    has plenty of nearby choice, so quality should matter more than a few
-    hundred meters, and since most places have hundreds of reviews, the
-    review count needs a higher bar before it stops mattering.
+    has plenty of nearby choice, so we're pickier:
+      - only places rated at least dense_min_rating, within
+        dense_max_distance_m (and distance scores 0 at that limit),
+      - quality outweighs distance, and the review count needs a higher
+        bar before it stops mattering, since most places have hundreds.
 
     Decided from the cached candidate list on every request, so it costs
     nothing extra and follows the area's data when it's refreshed.
     """
     settings = get_settings()
-    if len(candidates) >= settings.max_candidates:
-        return {
-            "min_votes_threshold": settings.dense_min_votes_threshold,
-            "weight_rating": settings.dense_weight_rating,
-            "weight_distance": settings.dense_weight_distance,
+    if len(candidates) < settings.max_candidates:
+        return candidates, {
+            "min_votes_threshold": settings.min_votes_threshold,
+            "weight_rating": settings.weight_rating,
+            "weight_distance": settings.weight_distance,
+            "max_distance_km": settings.search_radius_m / 1000,
         }
-    return {
-        "min_votes_threshold": settings.min_votes_threshold,
-        "weight_rating": settings.weight_rating,
-        "weight_distance": settings.weight_distance,
+
+    max_distance_km = settings.dense_max_distance_m / 1000
+    picked = [
+        c for c in candidates
+        if (c.get("rating") or 0) >= settings.dense_min_rating
+        and haversine_distance_km(lat, lon, c["lat"], c["lon"]) <= max_distance_km
+    ]
+    return picked, {
+        "min_votes_threshold": settings.dense_min_votes_threshold,
+        "weight_rating": settings.dense_weight_rating,
+        "weight_distance": settings.dense_weight_distance,
+        "max_distance_km": max_distance_km,
     }
 
 
@@ -139,12 +150,12 @@ def find_best_restaurants(lat: float, lon: float, limit: int = 10) -> list[Ranke
     if candidates is None:
         candidates = fetch_and_store_area(lat, lon)
 
+    candidates, params = _area_profile(candidates, lat, lon)
     ranked = rank_restaurants(
         candidates,
         user_lat=lat,
         user_lon=lon,
         prior_rating=settings.prior_rating,
-        max_distance_km=settings.search_radius_m / 1000,
-        **_scoring_params(candidates),
+        **params,
     )
     return ranked[:limit]

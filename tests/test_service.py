@@ -317,3 +317,51 @@ def test_dense_weights_sum_to_one():
     # default here rather than on the first dense request in production.
     settings = get_settings()
     assert settings.dense_weight_rating + settings.dense_weight_distance == pytest.approx(1.0)
+
+
+def _place(place_id: str, rating: float, meters_north: float) -> dict:
+    return {"place_id": place_id, "name": place_id, "rating": rating, "user_rating_count": 800,
+            "lat": USER_LAT + meters_north / 111_320, "lon": USER_LON}
+
+
+def _install_search_returning(monkeypatch, places: list[dict]):
+    monkeypatch.setattr(places_client, "search_restaurants", lambda lat, lon: [dict(p) for p in places])
+
+
+def test_dense_area_drops_low_rated_and_far_places(monkeypatch):
+    places = [
+        _place("good-near", 4.6, 300),
+        _place("ok-near", 4.1, 200),     # below DENSE_MIN_RATING (4.3)
+        _place("good-far", 4.8, 1200),   # beyond DENSE_MAX_DISTANCE_M (1000)
+    ]
+    _install_search_returning(monkeypatch, places)
+    _set_max_candidates(monkeypatch, 3)  # all slots filled -> dense
+
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert [r.place_id for r in results] == ["good-near"]
+
+
+def test_normal_area_keeps_low_rated_and_far_places(monkeypatch):
+    places = [
+        _place("good-near", 4.6, 300),
+        _place("ok-near", 4.1, 200),
+        _place("good-far", 4.8, 1200),
+    ]
+    _install_search_returning(monkeypatch, places)
+    _set_max_candidates(monkeypatch, 4)  # room to spare -> normal
+
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert {r.place_id for r in results} == {"good-near", "ok-near", "good-far"}
+
+
+def test_dense_area_scores_distance_against_the_tighter_limit(monkeypatch):
+    _install_search_returning(monkeypatch, [_place("edge", 4.6, 999)])
+    _set_max_candidates(monkeypatch, 1)
+    seen = _spy_on_ranking(monkeypatch)
+
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert seen["max_distance_km"] == get_settings().dense_max_distance_m / 1000
+    assert results[0].normalized_distance == pytest.approx(0.0, abs=0.01)

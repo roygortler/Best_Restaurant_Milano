@@ -11,11 +11,10 @@ of the raw Google response shape. That normalization is what lets the rest
 of the app (cache, scoring) stay ignorant of Google's JSON structure - if
 Google changes their response format, only this file needs to change.
 """
-import math
-
 import requests
 
 from app.config import get_settings
+from app.scoring import haversine_distance_km
 
 PLACES_BASE_URL = "https://places.googleapis.com/v1"
 
@@ -33,7 +32,6 @@ _TEXT_SEARCH_FIELD_MASK = ",".join([
 
 _PAGE_SIZE = 20       # Text Search's per-page maximum
 _MAX_PAGES = 3        # Text Search returns at most 60 results in total
-_METERS_PER_DEGREE_LAT = 111_320
 
 # Place Details returns a single place, so no "places." prefix.
 _PLACE_DETAILS_FIELD_MASK = ",".join([
@@ -61,41 +59,33 @@ def _normalize(raw: dict) -> dict:
     }
 
 
-def _bounding_box(lat: float, lon: float, radius_m: int) -> dict:
-    """Square of side 2*radius_m centered on (lat, lon).
-
-    Text Search only accepts a rectangle as a hard location restriction
-    (circles are bias-only). Places in the square's corners are up to
-    ~1.4x radius_m away; scoring gives anything past radius_m a distance
-    score of 0, so they can still appear but only on rating strength.
-    """
-    dlat = radius_m / _METERS_PER_DEGREE_LAT
-    dlon = radius_m / (_METERS_PER_DEGREE_LAT * math.cos(math.radians(lat)))
-    return {
-        "low": {"latitude": lat - dlat, "longitude": lon - dlon},
-        "high": {"latitude": lat + dlat, "longitude": lon + dlon},
-    }
-
-
 def search_restaurants(lat: float, lon: float, radius_m: int | None = None,
                        max_results: int | None = None,
                        min_rating: float | None = None) -> list[dict]:
-    """Find restaurants around (lat, lon) rated at least min_rating.
+    """Find restaurants within radius_m of (lat, lon) rated at least min_rating.
 
-    Returns a list of normalized place dicts (see _normalize). This is the
-    "discovery" call - it gets us place_ids and a first pass at rating
-    data.
+    Returns a list of normalized place dicts (see _normalize), closest
+    first. This is the "discovery" call - it gets us place_ids and a first
+    pass at rating data.
 
     Uses Text Search rather than Nearby Search because Nearby Search caps
     out at 20 results with no paging, which in a dense area like central
     Milan means only the 20 most popular places are ever considered. Text
-    Search pages up to 60, and Google stops sending a next page once it
-    runs out - so a quiet area costs 1 billed call and a dense one up to 3.
+    Search pages up to 60.
+
+    Results are ranked by distance (the default, RELEVANCE, spread the 60
+    over the whole area, so in central Milan over half landed >1km away
+    while well-rated places a few hundred meters off were left out).
+    Google only ranks by distance from a circle's center, and circles are
+    bias-only - results past the radius still come back, at the end. So we
+    drop those ourselves and stop paging once a page passes the radius:
+    a quiet area costs 1 billed call, a dense one up to 3.
     """
     settings = get_settings()
     radius_m = radius_m or settings.search_radius_m
     max_results = min(max_results or settings.max_candidates, _PAGE_SIZE * _MAX_PAGES)
     min_rating = settings.min_rating if min_rating is None else min_rating
+    radius_km = radius_m / 1000
 
     url = f"{PLACES_BASE_URL}/places:searchText"
     headers = {
@@ -111,7 +101,13 @@ def search_restaurants(lat: float, lon: float, radius_m: int | None = None,
         "strictTypeFiltering": True,
         "pageSize": _PAGE_SIZE,
         "minRating": min_rating,
-        "locationRestriction": {"rectangle": _bounding_box(lat, lon, radius_m)},
+        "rankPreference": "DISTANCE",
+        "locationBias": {
+            "circle": {
+                "center": {"latitude": lat, "longitude": lon},
+                "radius": float(radius_m),
+            }
+        },
     }
 
     results: dict[str, dict] = {}
@@ -125,12 +121,16 @@ def search_restaurants(lat: float, lon: float, radius_m: int | None = None,
             )
 
         payload = response.json()
+        passed_radius = False
         for raw in payload.get("places", []):
             place = _normalize(raw)
+            if haversine_distance_km(lat, lon, place["lat"], place["lon"]) > radius_km:
+                passed_radius = True
+                continue
             results.setdefault(place["place_id"], place)  # dedupe across pages
 
         page_token = payload.get("nextPageToken")
-        if not page_token or len(results) >= max_results:
+        if not page_token or passed_radius or len(results) >= max_results:
             break
 
     return list(results.values())[:max_results]
