@@ -1,13 +1,18 @@
-"""Tests for the request pipeline - fakeredis for the cache, and
-places_client.nearby_search monkeypatched so nothing touches the network.
+"""Tests for the request pipeline - fakeredis for the cache, an in-memory
+fake for Postgres, and places_client.nearby_search monkeypatched so nothing
+touches the network. The real Postgres layer is covered in test_db.py.
 """
+import json
 import os
+import time
 
 os.environ.setdefault("GOOGLE_PLACES_API_KEY", "test-key")
 
 import fakeredis
+import psycopg
+import pytest
 
-from app import cache, places_client, service
+from app import cache, db, places_client, service
 from app.config import get_settings
 
 USER_LAT, USER_LON = 45.4642, 9.1900
@@ -20,9 +25,38 @@ _FAKE_PLACES = [
 ]
 
 
-def setup_function():
+class FakeDB:
+    """Same interface as app.db, backed by dicts. Doesn't model staleness -
+    that's tested against real Postgres in test_db.py."""
+
+    def __init__(self):
+        self.areas = {}
+        self.places = {}
+
+    def get_area(self, area_key):
+        return self.areas.get(area_key)
+
+    def get_places(self, place_ids):
+        return {pid: self.places[pid] for pid in place_ids if pid in self.places}
+
+    def upsert_places(self, places):
+        for place in places:
+            self.places[place["place_id"]] = {"place": dict(place), "last_updated": time.time()}
+
+    def upsert_area(self, area_key, center_lat, center_lon, place_ids):
+        self.areas[area_key] = {"place_ids": list(place_ids), "center_lat": center_lat,
+                                "center_lon": center_lon, "last_updated": time.time()}
+
+
+@pytest.fixture(autouse=True)
+def fake_stores(monkeypatch):
     get_settings.cache_clear()
     cache._client = fakeredis.FakeRedis(decode_responses=True)
+
+    fake_db = FakeDB()
+    for name in ("get_area", "get_places", "upsert_places", "upsert_area"):
+        monkeypatch.setattr(db, name, getattr(fake_db, name))
+    return fake_db
 
 
 def _install_fake_search(monkeypatch) -> list:
@@ -37,7 +71,23 @@ def _install_fake_search(monkeypatch) -> list:
     return calls
 
 
-def test_cache_miss_calls_api_and_fills_cache(monkeypatch):
+def _redis_down():
+    server = fakeredis.FakeServer()
+    server.connected = False
+    cache._client = fakeredis.FakeRedis(server=server, decode_responses=True)
+
+
+def _postgres_down(monkeypatch):
+    def fail(*args, **kwargs):
+        raise psycopg.OperationalError("connection refused")
+
+    for name in ("get_area", "get_places", "upsert_places", "upsert_area"):
+        monkeypatch.setattr(db, name, fail)
+
+
+# --- Google tier ---------------------------------------------------------
+
+def test_cache_miss_calls_api_and_fills_both_stores(monkeypatch, fake_stores):
     calls = _install_fake_search(monkeypatch)
 
     results = service.find_best_restaurants(USER_LAT, USER_LON)
@@ -47,6 +97,19 @@ def test_cache_miss_calls_api_and_fills_cache(monkeypatch):
     assert cache.get_cached_area(USER_LAT, USER_LON) == ["near-ok", "far-great"]
     assert cache.get_cached_place("near-ok")["name"] == "Near OK"
 
+    area = fake_stores.get_area(cache.area_bucket_key(USER_LAT, USER_LON))
+    assert area["place_ids"] == ["near-ok", "far-great"]
+    assert (area["center_lat"], area["center_lon"]) == cache.bucket_center(USER_LAT, USER_LON)
+    assert set(fake_stores.places) == {"near-ok", "far-great"}
+
+
+def test_no_restaurants_found_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(places_client, "nearby_search", lambda lat, lon: [])
+
+    assert service.find_best_restaurants(USER_LAT, USER_LON) == []
+
+
+# --- Redis tier ----------------------------------------------------------
 
 def test_second_request_in_same_area_uses_cache(monkeypatch):
     calls = _install_fake_search(monkeypatch)
@@ -56,16 +119,6 @@ def test_second_request_in_same_area_uses_cache(monkeypatch):
     service.find_best_restaurants(USER_LAT + 0.00001, USER_LON + 0.00001)
 
     assert len(calls) == 1
-
-
-def test_missing_place_in_cached_area_triggers_refetch(monkeypatch):
-    calls = _install_fake_search(monkeypatch)
-    service.find_best_restaurants(USER_LAT, USER_LON)
-
-    cache.get_client().delete("place:near-ok")
-    service.find_best_restaurants(USER_LAT, USER_LON)
-
-    assert len(calls) == 2
 
 
 def test_results_are_ranked_and_limited(monkeypatch):
@@ -79,7 +132,122 @@ def test_results_are_ranked_and_limited(monkeypatch):
     assert results[0].place_id == all_results[0].place_id
 
 
-def test_no_restaurants_found_returns_empty_list(monkeypatch):
-    monkeypatch.setattr(places_client, "nearby_search", lambda lat, lon: [])
+# --- Postgres tier -------------------------------------------------------
 
-    assert service.find_best_restaurants(USER_LAT, USER_LON) == []
+def test_redis_wiped_serves_from_postgres_without_api_call(monkeypatch):
+    calls = _install_fake_search(monkeypatch)
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    cache.get_client().flushall()
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert len(calls) == 1
+    assert {r.place_id for r in results} == {"near-ok", "far-great"}
+
+
+def test_postgres_hit_refills_redis(monkeypatch):
+    _install_fake_search(monkeypatch)
+    service.find_best_restaurants(USER_LAT, USER_LON)
+    cache.get_client().flushall()
+
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert cache.get_cached_area(USER_LAT, USER_LON) == ["near-ok", "far-great"]
+    assert cache.get_cached_place("far-great")["name"] == "Far Great"
+
+
+def test_redis_refill_keeps_postgres_timestamp(monkeypatch, fake_stores):
+    # Data that's 6 days old in Postgres must not become "fresh" in Redis.
+    _install_fake_search(monkeypatch)
+    service.find_best_restaurants(USER_LAT, USER_LON)
+    six_days_ago = time.time() - 6 * 24 * 3600
+    for entry in fake_stores.places.values():
+        entry["last_updated"] = six_days_ago
+    for entry in fake_stores.areas.values():
+        entry["last_updated"] = six_days_ago
+    cache.get_client().flushall()
+
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    raw_area = json.loads(cache.get_client().get(cache.area_bucket_key(USER_LAT, USER_LON)))
+    raw_place = json.loads(cache.get_client().get("place:near-ok"))
+    assert raw_area["last_updated"] == six_days_ago
+    assert raw_place["last_updated"] == six_days_ago
+
+
+def test_place_missing_from_redis_falls_back_to_postgres(monkeypatch):
+    calls = _install_fake_search(monkeypatch)
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    cache.get_client().delete("place:near-ok")
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert len(calls) == 1
+
+
+def test_place_missing_from_both_stores_triggers_refetch(monkeypatch, fake_stores):
+    calls = _install_fake_search(monkeypatch)
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    cache.get_client().delete("place:near-ok")
+    del fake_stores.places["near-ok"]
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert len(calls) == 2
+
+
+# --- Stores down ---------------------------------------------------------
+
+def test_redis_down_serves_from_postgres(monkeypatch):
+    calls = _install_fake_search(monkeypatch)
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    _redis_down()
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert len(calls) == 1
+    assert len(results) == 2
+
+
+def test_redis_down_on_cold_start_still_answers_from_api(monkeypatch, fake_stores):
+    calls = _install_fake_search(monkeypatch)
+    _redis_down()
+
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert len(calls) == 1
+    assert len(results) == 2
+    assert set(fake_stores.places) == {"near-ok", "far-great"}
+
+
+def test_postgres_down_falls_back_to_api(monkeypatch):
+    calls = _install_fake_search(monkeypatch)
+    _postgres_down(monkeypatch)
+
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert len(calls) == 1
+    assert len(results) == 2
+    # Redis still got the results even though Postgres couldn't.
+    assert cache.get_cached_area(USER_LAT, USER_LON) == ["near-ok", "far-great"]
+
+
+def test_both_stores_down_still_answers_from_api(monkeypatch):
+    calls = _install_fake_search(monkeypatch)
+    _redis_down()
+    _postgres_down(monkeypatch)
+
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert len(calls) == 1
+    assert len(results) == 2
+
+
+def test_places_api_error_propagates(monkeypatch):
+    def failing_search(lat, lon):
+        raise places_client.PlacesAPIError("quota exceeded")
+
+    monkeypatch.setattr(places_client, "nearby_search", failing_search)
+
+    with pytest.raises(places_client.PlacesAPIError):
+        service.find_best_restaurants(USER_LAT, USER_LON)

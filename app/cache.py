@@ -49,7 +49,7 @@ def _bucket_indices(lat: float, lon: float) -> tuple[int, int]:
     return math.floor(lat / lat_cell_deg), math.floor(lon / lon_cell_deg)
 
 
-def _bucket_center(lat: float, lon: float) -> tuple[float, float]:
+def bucket_center(lat: float, lon: float) -> tuple[float, float]:
     """Center coordinate of the grid cell containing (lat, lon).
 
     Stored alongside each area's place_ids so the weekly refresh job has a
@@ -80,15 +80,20 @@ def get_cached_area(lat: float, lon: float) -> list[str] | None:
     return data["place_ids"]
 
 
-def set_cached_area(lat: float, lon: float, place_ids: list[str]) -> None:
-    """Store the place_ids discovered near (lat, lon) for this grid cell."""
+def set_cached_area(lat: float, lon: float, place_ids: list[str],
+                    last_updated: float | None = None) -> None:
+    """Store the place_ids discovered near (lat, lon) for this grid cell.
+
+    last_updated defaults to now; pass it explicitly when copying data in
+    from Postgres, so the copy doesn't look fresher than the original.
+    """
     settings = get_settings()
-    center_lat, center_lon = _bucket_center(lat, lon)
+    center_lat, center_lon = bucket_center(lat, lon)
     payload = json.dumps({
         "place_ids": place_ids,
         "center_lat": center_lat,
         "center_lon": center_lon,
-        "last_updated": time.time(),
+        "last_updated": last_updated if last_updated is not None else time.time(),
     })
     # Redis TTL is a backstop (2x the staleness window) so dead areas
     # eventually get evicted even if the refresh job stops running; the
@@ -109,12 +114,12 @@ def get_cached_place(place_id: str) -> dict | None:
     return data["place"]
 
 
-def set_cached_place(place: dict) -> None:
-    """Store/refresh a single restaurant's rating data."""
+def set_cached_place(place: dict, last_updated: float | None = None) -> None:
+    """Store/refresh a single restaurant's rating data (last_updated: see set_cached_area)."""
     settings = get_settings()
     payload = json.dumps({
         "place": place,
-        "last_updated": time.time(),
+        "last_updated": last_updated if last_updated is not None else time.time(),
     })
     get_client().set(f"place:{place['place_id']}", payload, ex=settings.cache_ttl_seconds * 2)
 

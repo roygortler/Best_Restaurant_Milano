@@ -17,6 +17,7 @@ load_dotenv()
 class Settings:
     google_places_api_key: str
     redis_url: str
+    database_url: str
     search_radius_m: int
     max_candidates: int
     min_votes_threshold: int  # m: reviews needed to fully trust a rating
@@ -44,6 +45,7 @@ def get_settings() -> Settings:
     return Settings(
         google_places_api_key=api_key,
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        database_url=os.getenv("DATABASE_URL", "postgresql://127.0.0.1:5432/best_restaurant"),
         search_radius_m=int(os.getenv("SEARCH_RADIUS_M", "1500")),
         max_candidates=int(os.getenv("MAX_CANDIDATES", "20")),
         min_votes_threshold=int(os.getenv("MIN_VOTES_THRESHOLD", "200")),
