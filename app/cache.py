@@ -5,7 +5,7 @@ Two tiers, both keyed for a reason:
 1. `place:{place_id}` - one restaurant's rating/review data.
 2. `area:{lat_bucket}:{lon_bucket}` - the list of place_ids discovered
    within a ~150m x 150m grid cell. This is what lets repeat requests from
-   the same neighborhood skip a live Nearby Search call entirely.
+   the same neighborhood skip a live Places search entirely.
 
 Distance is deliberately NOT cached anywhere here - it's cheap math computed
 live from the request's exact GPS coordinates (see scoring.py), not an API
@@ -53,7 +53,7 @@ def bucket_center(lat: float, lon: float) -> tuple[float, float]:
     """Center coordinate of the grid cell containing (lat, lon).
 
     Stored alongside each area's place_ids so the weekly refresh job has a
-    stable point to re-run Nearby Search against, without needing to
+    stable point to re-run the Places search against, without needing to
     remember the original request's exact coordinates.
     """
     lat_cell_deg = _AREA_CELL_SIZE_M / _METERS_PER_DEGREE_LAT

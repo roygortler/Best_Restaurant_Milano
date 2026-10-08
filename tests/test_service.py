@@ -1,5 +1,5 @@
 """Tests for the request pipeline - fakeredis for the cache, an in-memory
-fake for Postgres, and places_client.nearby_search monkeypatched so nothing
+fake for Postgres, and places_client.search_restaurants monkeypatched so nothing
 touches the network. The real Postgres layer is covered in test_db.py.
 """
 import json
@@ -60,14 +60,14 @@ def fake_stores(monkeypatch):
 
 
 def _install_fake_search(monkeypatch) -> list:
-    """Replace nearby_search with a fake; returns a list that records each call."""
+    """Replace search_restaurants with a fake; returns a list that records each call."""
     calls = []
 
-    def fake_nearby_search(lat, lon):
+    def fake_search_restaurants(lat, lon):
         calls.append((lat, lon))
         return [dict(p) for p in _FAKE_PLACES]
 
-    monkeypatch.setattr(places_client, "nearby_search", fake_nearby_search)
+    monkeypatch.setattr(places_client, "search_restaurants", fake_search_restaurants)
     return calls
 
 
@@ -104,7 +104,7 @@ def test_cache_miss_calls_api_and_fills_both_stores(monkeypatch, fake_stores):
 
 
 def test_no_restaurants_found_returns_empty_list(monkeypatch):
-    monkeypatch.setattr(places_client, "nearby_search", lambda lat, lon: [])
+    monkeypatch.setattr(places_client, "search_restaurants", lambda lat, lon: [])
 
     assert service.find_best_restaurants(USER_LAT, USER_LON) == []
 
@@ -247,7 +247,73 @@ def test_places_api_error_propagates(monkeypatch):
     def failing_search(lat, lon):
         raise places_client.PlacesAPIError("quota exceeded")
 
-    monkeypatch.setattr(places_client, "nearby_search", failing_search)
+    monkeypatch.setattr(places_client, "search_restaurants", failing_search)
 
     with pytest.raises(places_client.PlacesAPIError):
         service.find_best_restaurants(USER_LAT, USER_LON)
+
+
+# --- Dense-area scoring --------------------------------------------------
+
+def _spy_on_ranking(monkeypatch) -> dict:
+    """Record the keyword args find_best_restaurants passes to rank_restaurants."""
+    seen = {}
+    real_rank = service.rank_restaurants
+
+    def spy(candidates, **kwargs):
+        seen.update(kwargs)
+        return real_rank(candidates, **kwargs)
+
+    monkeypatch.setattr(service, "rank_restaurants", spy)
+    return seen
+
+
+def _set_max_candidates(monkeypatch, value: int):
+    monkeypatch.setenv("MAX_CANDIDATES", str(value))
+    get_settings.cache_clear()
+
+
+def test_full_search_uses_dense_scoring(monkeypatch):
+    # The fake search returns 2 places; a cap of 2 means every slot filled.
+    _install_fake_search(monkeypatch)
+    _set_max_candidates(monkeypatch, 2)
+    seen = _spy_on_ranking(monkeypatch)
+
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    settings = get_settings()
+    assert seen["min_votes_threshold"] == settings.dense_min_votes_threshold
+    assert seen["weight_rating"] == settings.dense_weight_rating
+    assert seen["weight_distance"] == settings.dense_weight_distance
+
+
+def test_partial_search_uses_normal_scoring(monkeypatch):
+    _install_fake_search(monkeypatch)
+    _set_max_candidates(monkeypatch, 3)
+    seen = _spy_on_ranking(monkeypatch)
+
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    settings = get_settings()
+    assert seen["min_votes_threshold"] == settings.min_votes_threshold
+    assert seen["weight_rating"] == settings.weight_rating
+    assert seen["weight_distance"] == settings.weight_distance
+
+
+def test_dense_mode_applies_to_cached_requests_too(monkeypatch):
+    calls = _install_fake_search(monkeypatch)
+    _set_max_candidates(monkeypatch, 2)
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    seen = _spy_on_ranking(monkeypatch)
+    service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert len(calls) == 1  # second request came from the cache
+    assert seen["min_votes_threshold"] == get_settings().dense_min_votes_threshold
+
+
+def test_dense_weights_sum_to_one():
+    # rank_restaurants rejects weights that don't sum to 1; catch a bad
+    # default here rather than on the first dense request in production.
+    settings = get_settings()
+    assert settings.dense_weight_rating + settings.dense_weight_distance == pytest.approx(1.0)

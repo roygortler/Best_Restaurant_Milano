@@ -1,7 +1,7 @@
 """Weekly refresh job.
 
-Re-runs Nearby Search once per *known area* (not once per restaurant), so a
-single API call refreshes both the restaurant list and every place's rating
+Re-runs the Places search once per *known area* (not once per restaurant), so
+one search (1-3 billed pages) refreshes both the restaurant list and every place's rating
 data for that whole neighborhood at once - see cache.py's module docstring
 for why areas are cached this way.
 
@@ -52,7 +52,7 @@ def refresh_all_areas() -> None:
         try:
             places = service.fetch_and_store_area(area["center_lat"], area["center_lon"])
         except places_client.PlacesAPIError:
-            logger.exception("Nearby search failed for area %s", area["key"])
+            logger.exception("Places search failed for area %s", area["key"])
             failed += 1
             continue
 
