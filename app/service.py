@@ -167,3 +167,51 @@ def find_best_restaurants(lat: float, lon: float, limit: int = 10,
         **params,
     )
     return ranked[:limit]
+
+
+def _normalize_address(address: str) -> str:
+    """Cache key for a typed address: case and spacing don't change where it is."""
+    return " ".join(address.lower().split())
+
+
+def geocode(address: str) -> dict | None:
+    """Typed address -> {lat, lon, address}, or None if Google can't find it.
+
+    Same tiers as restaurants - Redis, then Postgres, then Google - so an
+    address that was looked up before never goes to Google again while
+    its lookup is fresh. "Via Brera 10" and "via  brera 10" share an entry.
+    """
+    settings = get_settings()
+    query = _normalize_address(address)
+
+    try:
+        cached = cache.get_cached_geocode(query)
+        if cached is not None:
+            return cached["result"]
+    except redis.RedisError:
+        logger.warning("Redis unavailable, skipping to Postgres", exc_info=True)
+
+    try:
+        stored = db.get_geocode(query)
+    except psycopg.Error:
+        logger.warning("Postgres unavailable, skipping to Places API", exc_info=True)
+        stored = None
+    if stored is not None:
+        try:
+            # Only for what's left of the Postgres entry's freshness window.
+            cache.set_cached_geocode(query, stored["result"], max(1, int(stored["remaining_seconds"])))
+        except redis.RedisError:
+            logger.warning("Redis unavailable, could not refill from Postgres", exc_info=True)
+        return stored["result"]
+
+    result = places_client.geocode(address)
+    ttl = settings.geocode_ttl_seconds if result else settings.geocode_not_found_ttl_seconds
+    try:
+        cache.set_cached_geocode(query, result, ttl)
+    except redis.RedisError:
+        logger.warning("Redis unavailable, lookup not cached in Redis", exc_info=True)
+    try:
+        db.upsert_geocode(query, result)
+    except psycopg.Error:
+        logger.warning("Postgres unavailable, lookup not persisted", exc_info=True)
+    return result

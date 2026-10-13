@@ -149,3 +149,25 @@ def all_cached_areas() -> list[dict]:
             "cuisine": data.get("cuisine"),  # absent on areas cached before cuisines existed
         })
     return areas
+
+
+def _geocode_key(query: str) -> str:
+    return f"geocode:{query}"
+
+
+def get_cached_geocode(query: str) -> dict | None:
+    """Return {"result": {lat, lon, address} or None} if `query` was looked up recently.
+
+    A stored result of None means Google found nothing for that address -
+    remembered too, so a typo isn't sent to Google on every retry. Returns
+    None (no dict at all) when the address hasn't been looked up.
+
+    Unlike areas, Redis's own expiry is the freshness rule here: a lookup
+    is either reused or gone, there's no "stale but still listed" state.
+    """
+    raw = get_client().get(_geocode_key(query))
+    return None if raw is None else json.loads(raw)
+
+
+def set_cached_geocode(query: str, result: dict | None, ttl_seconds: int) -> None:
+    get_client().set(_geocode_key(query), json.dumps({"result": result}), ex=ttl_seconds)

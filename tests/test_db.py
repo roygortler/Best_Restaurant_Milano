@@ -44,7 +44,7 @@ def fresh_db(monkeypatch):
     get_settings.cache_clear()
     db._pool = None
     with db.get_pool().connection() as conn:
-        conn.execute("TRUNCATE places, areas")
+        conn.execute("TRUNCATE places, areas, geocodes")
     yield
     db._pool.close()
     db._pool = None
@@ -145,3 +145,33 @@ def test_area_cuisine_round_trip():
     cuisines = {a["key"]: a["cuisine"] for a in db.all_areas()}
 
     assert cuisines == {"area:1:2:sushi": "sushi", "area:1:2": None}
+
+
+_BRERA = {"lat": 45.4703, "lon": 9.1883, "address": "Via Brera, 10, Milano"}
+
+
+def test_geocode_round_trip():
+    db.upsert_geocode("via brera 10", _BRERA)
+
+    stored = db.get_geocode("via brera 10")
+
+    assert stored["result"] == _BRERA
+    assert stored["remaining_seconds"] > get_settings().geocode_ttl_seconds - 60
+
+
+def test_geocode_not_found_round_trip():
+    db.upsert_geocode("zzzz", None)
+
+    assert db.get_geocode("zzzz")["result"] is None
+    assert db.get_geocode("never") is None
+
+
+def test_geocode_not_found_expires_sooner_than_found():
+    db.upsert_geocode("via brera 10", _BRERA)
+    db.upsert_geocode("zzzz", None)
+    two_days = 2 * 24 * 3600
+    _age_row("geocodes", "query", "via brera 10", two_days)
+    _age_row("geocodes", "query", "zzzz", two_days)
+
+    assert db.get_geocode("via brera 10") is not None  # 180-day window
+    assert db.get_geocode("zzzz") is None              # 1-day window

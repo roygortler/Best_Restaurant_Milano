@@ -15,7 +15,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from app import places_client, service
+from app import service
 from app.cuisines import CUISINES, label_for
 from app.places_client import PlacesAPIError
 
@@ -54,7 +54,7 @@ def get_cuisines() -> dict:
 def geocode(address: str = Query(..., min_length=2, max_length=200)) -> dict:
     """Turn a typed address or landmark into coordinates."""
     try:
-        result = places_client.geocode(address)
+        result = service.geocode(address)
     except PlacesAPIError as exc:
         raise HTTPException(status_code=502, detail=f"Places API error: {exc}") from exc
     if result is None:

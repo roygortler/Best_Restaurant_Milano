@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS areas (
 -- existing databases in place. Old rows get NULL until they're refreshed.
 ALTER TABLE places ADD COLUMN IF NOT EXISTS primary_type TEXT;
 ALTER TABLE areas ADD COLUMN IF NOT EXISTS cuisine TEXT;
+
+-- Typed address -> coordinates. lat/lon/address are NULL when Google
+-- found nothing, so a typo isn't looked up again on every retry.
+CREATE TABLE IF NOT EXISTS geocodes (
+    query        TEXT PRIMARY KEY,
+    lat          DOUBLE PRECISION,
+    lon          DOUBLE PRECISION,
+    address      TEXT,
+    last_updated TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 # Short timeouts on purpose: Postgres is a fallback, so if it's down a
@@ -165,3 +175,50 @@ def all_areas() -> list[dict]:
         return conn.execute(
             "SELECT area_key AS key, center_lat, center_lon, cuisine FROM areas"
         ).fetchall()
+
+
+def get_geocode(query: str) -> dict | None:
+    """Return {"result": ..., "remaining_seconds": n} if `query` was looked up recently.
+
+    result is {lat, lon, address}, or None if Google found nothing. Found
+    and not-found lookups have separate freshness windows (see config);
+    remaining_seconds is what's left of it, for refilling Redis.
+    """
+    settings = get_settings()
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            SELECT lat, lon, address,
+                   extract(epoch FROM now() - last_updated)::float AS age_seconds
+            FROM geocodes
+            WHERE query = %s
+            """,
+            (query,),
+        ).fetchone()
+    if row is None:
+        return None
+
+    found = row["lat"] is not None
+    ttl = settings.geocode_ttl_seconds if found else settings.geocode_not_found_ttl_seconds
+    if row["age_seconds"] > ttl:
+        return None
+    result = {"lat": row["lat"], "lon": row["lon"], "address": row["address"]} if found else None
+    return {"result": result, "remaining_seconds": ttl - row["age_seconds"]}
+
+
+def upsert_geocode(query: str, result: dict | None) -> None:
+    """Store a lookup (result None = not found), stamping it with the current time."""
+    lat, lon, address = (result["lat"], result["lon"], result["address"]) if result else (None, None, None)
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO geocodes (query, lat, lon, address)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (query) DO UPDATE SET
+                lat = EXCLUDED.lat,
+                lon = EXCLUDED.lon,
+                address = EXCLUDED.address,
+                last_updated = now()
+            """,
+            (query, lat, lon, address),
+        )

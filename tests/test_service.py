@@ -32,6 +32,15 @@ class FakeDB:
     def __init__(self):
         self.areas = {}
         self.places = {}
+        self.geocodes = {}
+
+    def get_geocode(self, query):
+        if query not in self.geocodes:
+            return None
+        return {"result": self.geocodes[query], "remaining_seconds": 3600.0}
+
+    def upsert_geocode(self, query, result):
+        self.geocodes[query] = result
 
     def get_area(self, area_key):
         return self.areas.get(area_key)
@@ -55,7 +64,7 @@ def fake_stores(monkeypatch):
     cache._client = fakeredis.FakeRedis(decode_responses=True)
 
     fake_db = FakeDB()
-    for name in ("get_area", "get_places", "upsert_places", "upsert_area"):
+    for name in ("get_area", "get_places", "upsert_places", "upsert_area", "get_geocode", "upsert_geocode"):
         monkeypatch.setattr(db, name, getattr(fake_db, name))
     return fake_db
 
@@ -82,7 +91,7 @@ def _postgres_down(monkeypatch):
     def fail(*args, **kwargs):
         raise psycopg.OperationalError("connection refused")
 
-    for name in ("get_area", "get_places", "upsert_places", "upsert_area"):
+    for name in ("get_area", "get_places", "upsert_places", "upsert_area", "get_geocode", "upsert_geocode"):
         monkeypatch.setattr(db, name, fail)
 
 
@@ -411,3 +420,96 @@ def test_primary_type_reaches_the_ranked_results(monkeypatch):
     results = service.find_best_restaurants(USER_LAT, USER_LON)
 
     assert results[0].primary_type == "pizza_restaurant"
+
+
+# --- Address lookup ------------------------------------------------------
+
+_BRERA = {"lat": 45.4703, "lon": 9.1883, "address": "Via Brera, 10, 20121 Milano MI"}
+
+
+def _install_fake_geocode(monkeypatch, result=_BRERA) -> list:
+    calls = []
+
+    def fake_geocode(address):
+        calls.append(address)
+        return result
+
+    monkeypatch.setattr(places_client, "geocode", fake_geocode)
+    return calls
+
+
+def test_same_address_goes_to_google_only_once(monkeypatch):
+    calls = _install_fake_geocode(monkeypatch)
+
+    first = service.geocode("Via Brera 10")
+    second = service.geocode("Via Brera 10")
+
+    assert first == second == _BRERA
+    assert calls == ["Via Brera 10"]
+
+
+def test_address_case_and_spacing_dont_matter(monkeypatch):
+    calls = _install_fake_geocode(monkeypatch)
+
+    service.geocode("Via Brera 10")
+    service.geocode("  via   BRERA 10 ")
+
+    assert len(calls) == 1
+
+
+def test_different_addresses_are_looked_up_separately(monkeypatch):
+    calls = _install_fake_geocode(monkeypatch)
+
+    service.geocode("Via Brera 10")
+    service.geocode("Via Brera 12")
+
+    assert calls == ["Via Brera 10", "Via Brera 12"]
+
+
+def test_address_lookup_is_saved_to_both_stores(monkeypatch, fake_stores):
+    _install_fake_geocode(monkeypatch)
+
+    service.geocode("Via Brera 10")
+
+    assert cache.get_cached_geocode("via brera 10") == {"result": _BRERA}
+    assert fake_stores.geocodes["via brera 10"] == _BRERA
+
+
+def test_redis_wiped_address_comes_from_postgres(monkeypatch):
+    calls = _install_fake_geocode(monkeypatch)
+    service.geocode("Via Brera 10")
+
+    cache.get_client().flushall()
+    result = service.geocode("Via Brera 10")
+
+    assert result == _BRERA
+    assert len(calls) == 1
+    assert cache.get_cached_geocode("via brera 10") == {"result": _BRERA}  # refilled
+
+
+def test_not_found_address_is_remembered(monkeypatch, fake_stores):
+    calls = _install_fake_geocode(monkeypatch, result=None)
+
+    assert service.geocode("zzzz nowhere") is None
+    assert service.geocode("zzzz nowhere") is None
+
+    assert len(calls) == 1
+    assert cache.get_client().ttl("geocode:zzzz nowhere") <= get_settings().geocode_not_found_ttl_seconds
+
+
+def test_found_address_kept_for_the_long_ttl(monkeypatch):
+    _install_fake_geocode(monkeypatch)
+
+    service.geocode("Via Brera 10")
+
+    ttl = cache.get_client().ttl("geocode:via brera 10")
+    assert ttl > get_settings().geocode_not_found_ttl_seconds
+
+
+def test_address_lookup_works_with_both_stores_down(monkeypatch):
+    calls = _install_fake_geocode(monkeypatch)
+    _redis_down()
+    _postgres_down(monkeypatch)
+
+    assert service.geocode("Via Brera 10") == _BRERA
+    assert len(calls) == 1

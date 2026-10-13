@@ -33,6 +33,9 @@ class Settings:
     dense_min_rating: float       # stricter than min_rating; applied after fetching
     dense_max_distance_m: int     # candidates farther than this are dropped
     cache_ttl_seconds: int
+    # How long a typed address -> coordinates lookup is reused (see service.geocode).
+    geocode_ttl_seconds: int
+    geocode_not_found_ttl_seconds: int
     # Where typed addresses are looked up first (see places_client.geocode).
     city_lat: float
     city_lon: float
@@ -72,6 +75,8 @@ def get_settings() -> Settings:
         dense_min_rating=float(os.getenv("DENSE_MIN_RATING", "4.3")),
         dense_max_distance_m=int(os.getenv("DENSE_MAX_DISTANCE_M", "1000")),
         cache_ttl_seconds=int(os.getenv("CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60))),
+        geocode_ttl_seconds=int(os.getenv("GEOCODE_TTL_SECONDS", str(180 * 24 * 60 * 60))),
+        geocode_not_found_ttl_seconds=int(os.getenv("GEOCODE_NOT_FOUND_TTL_SECONDS", str(24 * 60 * 60))),
         city_lat=float(os.getenv("CITY_LAT", "45.4642")),
         city_lon=float(os.getenv("CITY_LON", "9.1900")),
         city_radius_m=int(os.getenv("CITY_RADIUS_M", "15000")),

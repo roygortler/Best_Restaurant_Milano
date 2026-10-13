@@ -7,7 +7,7 @@ os.environ.setdefault("GOOGLE_PLACES_API_KEY", "test-key")
 
 from fastapi.testclient import TestClient
 
-from app import places_client, service
+from app import service
 from app.cuisines import CUISINES
 from app.main import app
 from app.places_client import PlacesAPIError
@@ -103,7 +103,7 @@ def test_cuisines_lists_every_cuisine():
 
 def test_geocode_returns_coordinates(monkeypatch):
     found = {"lat": 45.4719, "lon": 9.1881, "address": "Via Brera, 10, Milano"}
-    monkeypatch.setattr(places_client, "geocode", lambda address: found)
+    monkeypatch.setattr(service, "geocode", lambda address: found)
 
     response = client.get("/geocode", params={"address": "Via Brera 10"})
 
@@ -112,7 +112,7 @@ def test_geocode_returns_coordinates(monkeypatch):
 
 
 def test_geocode_not_found_is_404(monkeypatch):
-    monkeypatch.setattr(places_client, "geocode", lambda address: None)
+    monkeypatch.setattr(service, "geocode", lambda address: None)
 
     assert client.get("/geocode", params={"address": "zzzz"}).status_code == 404
 
@@ -121,7 +121,7 @@ def test_geocode_api_error_is_502(monkeypatch):
     def failing(address):
         raise PlacesAPIError("quota exceeded")
 
-    monkeypatch.setattr(places_client, "geocode", failing)
+    monkeypatch.setattr(service, "geocode", failing)
 
     assert client.get("/geocode", params={"address": "Duomo"}).status_code == 502
 

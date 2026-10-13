@@ -110,3 +110,19 @@ def test_all_cached_areas_reports_each_areas_cuisine():
     cuisines = {a["key"]: a["cuisine"] for a in cache.all_cached_areas()}
 
     assert sorted(cuisines.values(), key=str) == [None, "sushi"]
+
+
+def test_geocode_round_trip_with_expiry():
+    result = {"lat": 45.47, "lon": 9.19, "address": "Via Brera, 10"}
+
+    cache.set_cached_geocode("via brera 10", result, ttl_seconds=3600)
+
+    assert cache.get_cached_geocode("via brera 10") == {"result": result}
+    assert 0 < cache.get_client().ttl("geocode:via brera 10") <= 3600
+
+
+def test_geocode_not_found_is_distinguishable_from_never_looked_up():
+    cache.set_cached_geocode("zzzz", None, ttl_seconds=60)
+
+    assert cache.get_cached_geocode("zzzz") == {"result": None}  # looked up, nothing found
+    assert cache.get_cached_geocode("never") is None             # not looked up yet
