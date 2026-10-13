@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Best Restaurant Milano</title>
+<style>
+  :root {
+    --bg: #faf8f5;
+    --surface: #ffffff;
+    --text: #1f1b16;
+    --muted: #6b645b;
+    --border: #e6e0d7;
+    --accent: #b5452b;
+    --accent-text: #ffffff;
+    --star: #c98a12;
+    --chip-bg: #f3ece3;
+    --error: #b42318;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161412;
+      --surface: #201d1a;
+      --text: #f2ede6;
+      --muted: #a39b90;
+      --border: #36312b;
+      --accent: #e07a5f;
+      --accent-text: #1a1310;
+      --star: #e8b84a;
+      --chip-bg: #2c2722;
+      --error: #f97066;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px 48px; }
+
+  h1 { font-size: 1.75rem; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .tagline { color: var(--muted); margin: 0 0 24px; }
+
+  form {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    display: grid;
+    gap: 14px;
+  }
+  label { display: block; font-size: 0.875rem; font-weight: 600; margin-bottom: 6px; }
+  .row { display: flex; gap: 8px; }
+  input, select, button { font: inherit; }
+  input, select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+  }
+  input:focus, select:focus, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  button {
+    border: 0;
+    border-radius: 8px;
+    padding: 10px 16px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  .primary { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+  .secondary { background: var(--chip-bg); color: var(--text); }
+
+  #status { min-height: 1.5em; margin: 16px 2px 8px; color: var(--muted); font-size: 0.9375rem; }
+  #status.error { color: var(--error); }
+
+  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+  li {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    display: grid;
+    grid-template-columns: 2rem 1fr;
+    gap: 2px 10px;
+  }
+  .rank { grid-row: span 2; font-weight: 700; font-size: 1.25rem; color: var(--muted); }
+  .name { font-weight: 650; color: var(--text); text-decoration: none; }
+  .name:hover { text-decoration: underline; }
+  .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; color: var(--muted); font-size: 0.875rem; }
+  .stars { color: var(--star); font-weight: 600; }
+  .chip { background: var(--chip-bg); color: var(--text); border-radius: 999px; padding: 1px 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Best Restaurant</h1>
+  <p class="tagline">The best-rated places near you in Milan, weighing rating, reviews and distance.</p>
+
+  <form id="search-form">
+    <div>
+      <label for="location">Where are you?</label>
+      <div class="row">
+        <input id="location" type="text" autocomplete="street-address"
+               placeholder="e.g. Piazza del Duomo, or Via Brera 10" required>
+        <button type="button" class="secondary" id="locate-btn">Use my location</button>
+      </div>
+    </div>
+    <div>
+      <label for="cuisine">What do you feel like?</label>
+      <select id="cuisine">
+        <option value="">All cuisines</option>
+      </select>
+    </div>
+    <button type="submit" class="primary" id="search-btn">Find the best restaurants</button>
+  </form>
+
+  <p id="status" role="status" aria-live="polite"></p>
+  <ol id="results"></ol>
+</main>
+
+<script>
+  const form = document.getElementById("search-form");
+  const locationInput = document.getElementById("location");
+  const cuisineSelect = document.getElementById("cuisine");
+  const locateBtn = document.getElementById("locate-btn");
+  const searchBtn = document.getElementById("search-btn");
+  const statusEl = document.getElementById("status");
+  const resultsEl = document.getElementById("results");
+
+  // Set when "Use my location" succeeds; cleared as soon as the user types,
+  // so a typed address always wins over a stale GPS fix.
+  let gpsCoords = null;
+
+  function setStatus(text, isError = false) {
+    statusEl.textContent = text;
+    statusEl.classList.toggle("error", isError);
+  }
+
+  async function getJson(url) {
+    const response = await fetch(url);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const detail = typeof body.detail === "string" ? body.detail : "Something went wrong";
+      throw new Error(detail);
+    }
+    return body;
+  }
+
+  function formatDistance(km) {
+    return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
+  }
+
+  // Built with textContent, never innerHTML: restaurant names come from
+  // Google and must not be able to inject markup into the page.
+  function renderResults(results) {
+    resultsEl.replaceChildren();
+    results.forEach((r, i) => {
+      const item = document.createElement("li");
+
+      const rank = document.createElement("span");
+      rank.className = "rank";
+      rank.textContent = i + 1;
+
+      const name = document.createElement("a");
+      name.className = "name";
+      name.href = r.maps_url;
+      name.target = "_blank";
+      name.rel = "noopener";
+      name.textContent = r.name;
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const stars = document.createElement("span");
+      stars.className = "stars";
+      stars.textContent = r.rating != null ? `★ ${r.rating.toFixed(1)}` : "No rating";
+      const reviews = document.createElement("span");
+      reviews.textContent = `${r.user_rating_count.toLocaleString()} reviews`;
+      const distance = document.createElement("span");
+      distance.textContent = formatDistance(r.distance_km);
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.textContent = r.cuisine;
+      meta.append(stars, reviews, distance, chip);
+
+      item.append(rank, name, meta);
+      resultsEl.append(item);
+    });
+  }
+
+  async function loadCuisines() {
+    try {
+      const { cuisines } = await getJson("/cuisines");
+      for (const c of cuisines) {
+        const option = document.createElement("option");
+        option.value = c.key;
+        option.textContent = c.label;
+        cuisineSelect.append(option);
+      }
+      try {
+        const saved = localStorage.getItem("cuisine");
+        if (saved && cuisines.some(c => c.key === saved)) cuisineSelect.value = saved;
+      } catch (_) { /* storage blocked - just use the default */ }
+    } catch (err) {
+      setStatus("Couldn't load the cuisine list - searching all cuisines.", true);
+    }
+  }
+
+  locationInput.addEventListener("input", () => { gpsCoords = null; });
+
+  cuisineSelect.addEventListener("change", () => {
+    try { localStorage.setItem("cuisine", cuisineSelect.value); } catch (_) {}
+  });
+
+  locateBtn.addEventListener("click", () => {
+    if (!navigator.geolocation) {
+      setStatus("Your browser can't share its location - type an address instead.", true);
+      return;
+    }
+    setStatus("Finding your location…");
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        gpsCoords = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+        locationInput.value = "My current location";
+        setStatus("Got your location. Pick a cuisine and search.");
+      },
+      () => setStatus("Couldn't get your location - type an address instead.", true),
+      { enableHighAccuracy: true, timeout: 10000 },
+    );
+  });
+
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    searchBtn.disabled = true;
+    resultsEl.replaceChildren();
+
+    try {
+      let coords = gpsCoords;
+      let placeLabel = "your location";
+      if (!coords) {
+        setStatus("Looking up the address…");
+        const found = await getJson(`/geocode?address=${encodeURIComponent(locationInput.value.trim())}`);
+        coords = { lat: found.lat, lon: found.lon };
+        placeLabel = found.address;
+      }
+
+      const cuisineLabel = cuisineSelect.value
+        ? cuisineSelect.options[cuisineSelect.selectedIndex].text
+        : "restaurants";
+      setStatus(`Finding the best ${cuisineLabel.toLowerCase()} near ${placeLabel}…`);
+
+      const params = new URLSearchParams({ lat: coords.lat, lon: coords.lon, limit: 10 });
+      if (cuisineSelect.value) params.set("cuisine", cuisineSelect.value);
+      const { results } = await getJson(`/restaurants?${params}`);
+
+      if (results.length === 0) {
+        setStatus(`No well-rated ${cuisineLabel.toLowerCase()} found near ${placeLabel}.`);
+      } else {
+        setStatus(`Top ${results.length} near ${placeLabel}`);
+        renderResults(results);
+      }
+    } catch (err) {
+      setStatus(err.message, true);
+    } finally {
+      searchBtn.disabled = false;
+    }
+  });
+
+  loadCuisines();
+</script>
+</body>
+</html>
