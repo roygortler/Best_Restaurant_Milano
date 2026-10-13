@@ -62,15 +62,22 @@ def bucket_center(lat: float, lon: float) -> tuple[float, float]:
     return (lat_bucket + 0.5) * lat_cell_deg, (lon_bucket + 0.5) * lon_cell_deg
 
 
-def area_bucket_key(lat: float, lon: float) -> str:
+def area_bucket_key(lat: float, lon: float, cuisine: str | None = None) -> str:
+    """Key for the grid cell containing (lat, lon), one per cuisine.
+
+    "area:33740:4783" is all restaurants in that cell; a cuisine search
+    gets its own list, "area:33740:4783:japanese", since it's a separate
+    Places search with different results.
+    """
     lat_bucket, lon_bucket = _bucket_indices(lat, lon)
-    return f"area:{lat_bucket}:{lon_bucket}"
+    key = f"area:{lat_bucket}:{lon_bucket}"
+    return f"{key}:{cuisine}" if cuisine else key
 
 
-def get_cached_area(lat: float, lon: float) -> list[str] | None:
+def get_cached_area(lat: float, lon: float, cuisine: str | None = None) -> list[str] | None:
     """Return cached place_ids near (lat, lon), or None if missing/stale."""
     settings = get_settings()
-    raw = get_client().get(area_bucket_key(lat, lon))
+    raw = get_client().get(area_bucket_key(lat, lon, cuisine))
     if raw is None:
         return None
 
@@ -81,7 +88,7 @@ def get_cached_area(lat: float, lon: float) -> list[str] | None:
 
 
 def set_cached_area(lat: float, lon: float, place_ids: list[str],
-                    last_updated: float | None = None) -> None:
+                    last_updated: float | None = None, cuisine: str | None = None) -> None:
     """Store the place_ids discovered near (lat, lon) for this grid cell.
 
     last_updated defaults to now; pass it explicitly when copying data in
@@ -93,12 +100,14 @@ def set_cached_area(lat: float, lon: float, place_ids: list[str],
         "place_ids": place_ids,
         "center_lat": center_lat,
         "center_lon": center_lon,
+        "cuisine": cuisine,
         "last_updated": last_updated if last_updated is not None else time.time(),
     })
     # Redis TTL is a backstop (2x the staleness window) so dead areas
     # eventually get evicted even if the refresh job stops running; the
     # is_stale() check above is what actually drives refresh decisions.
-    get_client().set(area_bucket_key(lat, lon), payload, ex=settings.cache_ttl_seconds * 2)
+    get_client().set(area_bucket_key(lat, lon, cuisine), payload,
+                     ex=settings.cache_ttl_seconds * 2)
 
 
 def get_cached_place(place_id: str) -> dict | None:
@@ -125,7 +134,7 @@ def set_cached_place(place: dict, last_updated: float | None = None) -> None:
 
 
 def all_cached_areas() -> list[dict]:
-    """List every cached area (key + center coords), for the weekly refresh job."""
+    """List every cached area (key, center coords, cuisine), for the weekly refresh job."""
     client = get_client()
     areas = []
     for key in client.scan_iter(match="area:*"):
@@ -137,5 +146,6 @@ def all_cached_areas() -> list[dict]:
             "key": key,
             "center_lat": data["center_lat"],
             "center_lon": data["center_lon"],
+            "cuisine": data.get("cuisine"),  # absent on areas cached before cuisines existed
         })
     return areas

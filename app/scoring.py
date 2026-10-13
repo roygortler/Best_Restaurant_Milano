@@ -46,6 +46,7 @@ class RankedRestaurant:
     normalized_rating: float
     normalized_distance: float
     final_score: float
+    primary_type: str | None = None  # Google's main category, e.g. "pizza_restaurant"
 
 
 def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -136,6 +137,7 @@ def rank_restaurants(
             normalized_rating=normalized_ratings[i],
             normalized_distance=normalized_distances[i],
             final_score=weight_rating * normalized_ratings[i] + weight_distance * normalized_distances[i],
+            primary_type=c.get("primary_type"),
         )
         for i, c in enumerate(candidates)
     ]

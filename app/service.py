@@ -32,10 +32,10 @@ from app.scoring import RankedRestaurant, haversine_distance_km, rank_restaurant
 logger = logging.getLogger(__name__)
 
 
-def _load_from_redis(lat: float, lon: float) -> list[dict] | None:
+def _load_from_redis(lat: float, lon: float, cuisine: str | None) -> list[dict] | None:
     """Return the cached places for this area, or None if anything is missing."""
     try:
-        place_ids = cache.get_cached_area(lat, lon)
+        place_ids = cache.get_cached_area(lat, lon, cuisine)
         if place_ids is None:
             return None
 
@@ -51,10 +51,10 @@ def _load_from_redis(lat: float, lon: float) -> list[dict] | None:
         return None
 
 
-def _load_from_postgres(lat: float, lon: float) -> list[dict] | None:
+def _load_from_postgres(lat: float, lon: float, cuisine: str | None) -> list[dict] | None:
     """Return this area's places from Postgres (refilling Redis), or None if incomplete."""
     try:
-        area = db.get_area(cache.area_bucket_key(lat, lon))
+        area = db.get_area(cache.area_bucket_key(lat, lon, cuisine))
         if area is None:
             return None
         places = db.get_places(area["place_ids"])
@@ -70,33 +70,35 @@ def _load_from_postgres(lat: float, lon: float) -> list[dict] | None:
         # Postgres data does, not a full TTL from now.
         for entry in places.values():
             cache.set_cached_place(entry["place"], last_updated=entry["last_updated"])
-        cache.set_cached_area(lat, lon, area["place_ids"], last_updated=area["last_updated"])
+        cache.set_cached_area(lat, lon, area["place_ids"], last_updated=area["last_updated"],
+                              cuisine=cuisine)
     except redis.RedisError:
         logger.warning("Redis unavailable, could not refill from Postgres", exc_info=True)
 
     return [places[place_id]["place"] for place_id in area["place_ids"]]
 
 
-def fetch_and_store_area(lat: float, lon: float) -> list[dict]:
+def fetch_and_store_area(lat: float, lon: float, cuisine: str | None = None) -> list[dict]:
     """Run a live Places search and write the results to Redis and Postgres.
 
     Also used by the weekly refresh job. Raises PlacesAPIError if the
     search fails; a store being down is logged and skipped.
     """
-    places = places_client.search_restaurants(lat, lon)
+    places = places_client.search_restaurants(lat, lon, cuisine=cuisine)
     place_ids = [place["place_id"] for place in places]
 
     try:
         for place in places:
             cache.set_cached_place(place)
-        cache.set_cached_area(lat, lon, place_ids)
+        cache.set_cached_area(lat, lon, place_ids, cuisine=cuisine)
     except redis.RedisError:
         logger.warning("Redis unavailable, results not cached in Redis", exc_info=True)
 
     try:
         center_lat, center_lon = cache.bucket_center(lat, lon)
         db.upsert_places(places)
-        db.upsert_area(cache.area_bucket_key(lat, lon), center_lat, center_lon, place_ids)
+        db.upsert_area(cache.area_bucket_key(lat, lon, cuisine), center_lat, center_lon,
+                       place_ids, cuisine=cuisine)
     except psycopg.Error:
         logger.warning("Postgres unavailable, results not persisted", exc_info=True)
 
@@ -140,15 +142,21 @@ def _area_profile(candidates: list[dict], lat: float, lon: float) -> tuple[list[
     }
 
 
-def find_best_restaurants(lat: float, lon: float, limit: int = 10) -> list[RankedRestaurant]:
-    """Return the top `limit` restaurants near (lat, lon), best first."""
+def find_best_restaurants(lat: float, lon: float, limit: int = 10,
+                          cuisine: str | None = None) -> list[RankedRestaurant]:
+    """Return the top `limit` restaurants near (lat, lon), best first.
+
+    cuisine is a key of cuisines.CUISINES, or None for every kind of
+    restaurant. Each cuisine is cached as its own area list, so it's
+    searched once per grid cell and then served from the cache.
+    """
     settings = get_settings()
 
-    candidates = _load_from_redis(lat, lon)
+    candidates = _load_from_redis(lat, lon, cuisine)
     if candidates is None:
-        candidates = _load_from_postgres(lat, lon)
+        candidates = _load_from_postgres(lat, lon, cuisine)
     if candidates is None:
-        candidates = fetch_and_store_area(lat, lon)
+        candidates = fetch_and_store_area(lat, lon, cuisine)
 
     candidates, params = _area_profile(candidates, lat, lon)
     ranked = rank_restaurants(

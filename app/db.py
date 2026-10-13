@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS areas (
     place_ids    TEXT[] NOT NULL,
     last_updated TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Added after the tables first shipped; ADD COLUMN IF NOT EXISTS upgrades
+-- existing databases in place. Old rows get NULL until they're refreshed.
+ALTER TABLE places ADD COLUMN IF NOT EXISTS primary_type TEXT;
+ALTER TABLE areas ADD COLUMN IF NOT EXISTS cuisine TEXT;
 """
 
 # Short timeouts on purpose: Postgres is a fallback, so if it's down a
@@ -95,7 +100,7 @@ def get_places(place_ids: list[str]) -> dict[str, dict]:
     with get_pool().connection() as conn:
         rows = conn.execute(
             """
-            SELECT place_id, name, rating, user_rating_count, lat, lon,
+            SELECT place_id, name, rating, user_rating_count, lat, lon, primary_type,
                    extract(epoch FROM last_updated)::float AS last_updated
             FROM places
             WHERE place_id = ANY(%s)
@@ -118,40 +123,45 @@ def upsert_places(places: list[dict]) -> None:
     with get_pool().connection() as conn, conn.cursor() as cur:
         cur.executemany(
             """
-            INSERT INTO places (place_id, name, rating, user_rating_count, lat, lon)
-            VALUES (%(place_id)s, %(name)s, %(rating)s, %(user_rating_count)s, %(lat)s, %(lon)s)
+            INSERT INTO places (place_id, name, rating, user_rating_count, lat, lon, primary_type)
+            VALUES (%(place_id)s, %(name)s, %(rating)s, %(user_rating_count)s, %(lat)s, %(lon)s,
+                    %(primary_type)s)
             ON CONFLICT (place_id) DO UPDATE SET
                 name = EXCLUDED.name,
                 rating = EXCLUDED.rating,
                 user_rating_count = EXCLUDED.user_rating_count,
                 lat = EXCLUDED.lat,
                 lon = EXCLUDED.lon,
+                primary_type = EXCLUDED.primary_type,
                 last_updated = now()
             """,
-            places,
+            # Places cached before primary_type existed may lack the key.
+            [{"primary_type": None, **place} for place in places],
         )
 
 
-def upsert_area(area_key: str, center_lat: float, center_lon: float, place_ids: list[str]) -> None:
+def upsert_area(area_key: str, center_lat: float, center_lon: float, place_ids: list[str],
+                cuisine: str | None = None) -> None:
     """Insert or refresh an area's place list, stamping it with the current time."""
     with get_pool().connection() as conn:
         conn.execute(
             """
-            INSERT INTO areas (area_key, center_lat, center_lon, place_ids)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO areas (area_key, center_lat, center_lon, place_ids, cuisine)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (area_key) DO UPDATE SET
                 center_lat = EXCLUDED.center_lat,
                 center_lon = EXCLUDED.center_lon,
                 place_ids = EXCLUDED.place_ids,
+                cuisine = EXCLUDED.cuisine,
                 last_updated = now()
             """,
-            (area_key, center_lat, center_lon, place_ids),
+            (area_key, center_lat, center_lon, place_ids, cuisine),
         )
 
 
 def all_areas() -> list[dict]:
-    """List every known area (key + center coords), stale or not, for the refresh job."""
+    """List every known area (key, center coords, cuisine), stale or not, for the refresh job."""
     with get_pool().connection() as conn:
         return conn.execute(
-            "SELECT area_key AS key, center_lat, center_lon FROM areas"
+            "SELECT area_key AS key, center_lat, center_lon, cuisine FROM areas"
         ).fetchall()

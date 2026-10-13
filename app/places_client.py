@@ -14,6 +14,7 @@ Google changes their response format, only this file needs to change.
 import requests
 
 from app.config import get_settings
+from app.cuisines import CUISINES
 from app.scoring import haversine_distance_km
 
 PLACES_BASE_URL = "https://places.googleapis.com/v1"
@@ -27,7 +28,15 @@ _TEXT_SEARCH_FIELD_MASK = ",".join([
     "places.location",
     "places.rating",
     "places.userRatingCount",
+    "places.primaryType",
     "nextPageToken",
+])
+
+# Address lookup only needs where the place is. These fields are billed at
+# a cheaper tier than the rating fields above.
+_GEOCODE_FIELD_MASK = ",".join([
+    "places.location",
+    "places.formattedAddress",
 ])
 
 _PAGE_SIZE = 20       # Text Search's per-page maximum
@@ -56,13 +65,21 @@ def _normalize(raw: dict) -> dict:
         "user_rating_count": raw.get("userRatingCount", 0),
         "lat": location.get("latitude"),
         "lon": location.get("longitude"),
+        # e.g. "pizza_restaurant", "sandwich_shop" - shown as the cuisine.
+        "primary_type": raw.get("primaryType"),
     }
 
 
 def search_restaurants(lat: float, lon: float, radius_m: int | None = None,
                        max_results: int | None = None,
-                       min_rating: float | None = None) -> list[dict]:
+                       min_rating: float | None = None,
+                       cuisine: str | None = None) -> list[dict]:
     """Find restaurants within radius_m of (lat, lon) rated at least min_rating.
+
+    cuisine is a key of cuisines.CUISINES; None searches all restaurants.
+    A cuisine gets its own search rather than filtering the general one,
+    because the 60 nearest restaurants might include only a handful of,
+    say, Korean places, while there are dozens a little further out.
 
     Returns a list of normalized place dicts (see _normalize), closest
     first. This is the "discovery" call - it gets us place_ids and a first
@@ -86,6 +103,7 @@ def search_restaurants(lat: float, lon: float, radius_m: int | None = None,
     max_results = min(max_results or settings.max_candidates, _PAGE_SIZE * _MAX_PAGES)
     min_rating = settings.min_rating if min_rating is None else min_rating
     radius_km = radius_m / 1000
+    google_type = CUISINES[cuisine]["google_type"] if cuisine else "restaurant"
 
     url = f"{PLACES_BASE_URL}/places:searchText"
     headers = {
@@ -96,8 +114,8 @@ def search_restaurants(lat: float, lon: float, radius_m: int | None = None,
     # Google requires every page request to repeat the original parameters
     # exactly, with only pageToken added.
     base_body = {
-        "textQuery": "restaurant",
-        "includedType": "restaurant",
+        "textQuery": google_type.replace("_", " "),
+        "includedType": google_type,
         "strictTypeFiltering": True,
         "pageSize": _PAGE_SIZE,
         "minRating": min_rating,
@@ -134,6 +152,50 @@ def search_restaurants(lat: float, lon: float, radius_m: int | None = None,
             break
 
     return list(results.values())[:max_results]
+
+
+def geocode(address: str) -> dict | None:
+    """Turn a typed address or landmark into {lat, lon, address}, or None.
+
+    Uses Text Search rather than the separate Geocoding API so the existing
+    key (restricted to Places API (New)) keeps working. Results are biased
+    toward the configured city, so "Duomo" means Milan's, but a full
+    address elsewhere still resolves.
+    """
+    settings = get_settings()
+    body = {
+        "textQuery": address,
+        "pageSize": 1,
+        "regionCode": settings.city_region_code,
+        "locationBias": {
+            "circle": {
+                "center": {"latitude": settings.city_lat, "longitude": settings.city_lon},
+                "radius": float(settings.city_radius_m),
+            }
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": settings.google_places_api_key,
+        "X-Goog-FieldMask": _GEOCODE_FIELD_MASK,
+    }
+
+    response = requests.post(f"{PLACES_BASE_URL}/places:searchText",
+                             headers=headers, json=body, timeout=10)
+    if response.status_code != 200:
+        raise PlacesAPIError(
+            f"Address lookup failed ({response.status_code}): {response.text}"
+        )
+
+    places = response.json().get("places", [])
+    if not places:
+        return None
+    place = places[0]
+    return {
+        "lat": place["location"]["latitude"],
+        "lon": place["location"]["longitude"],
+        "address": place.get("formattedAddress", address),
+    }
 
 
 def get_place_details(place_id: str) -> dict:

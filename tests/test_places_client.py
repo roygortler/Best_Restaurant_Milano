@@ -53,7 +53,8 @@ def _install_pages(monkeypatch, pages: list[dict]) -> list[dict]:
 
 
 def test_search_restaurants_normalizes_response(monkeypatch):
-    _install_pages(monkeypatch, [{"places": [_raw_place("place-123")]}])
+    raw = {**_raw_place("place-123"), "primaryType": "pizza_restaurant"}
+    _install_pages(monkeypatch, [{"places": [raw]}])
 
     results = places_client.search_restaurants(lat=45.4642, lon=9.1900)
 
@@ -65,8 +66,63 @@ def test_search_restaurants_normalizes_response(monkeypatch):
             "user_rating_count": 210,
             "lat": 45.4642,
             "lon": 9.1900,
+            "primary_type": "pizza_restaurant",
         }
     ]
+
+
+def test_search_restaurants_asks_for_primary_type(monkeypatch):
+    captured = _install_pages(monkeypatch, [{"places": []}])
+
+    places_client.search_restaurants(lat=45.4642, lon=9.1900)
+
+    assert "places.primaryType" in captured[0]["headers"]["X-Goog-FieldMask"]
+
+
+def test_search_restaurants_with_cuisine_searches_that_type(monkeypatch):
+    captured = _install_pages(monkeypatch, [{"places": []}])
+
+    places_client.search_restaurants(lat=45.4642, lon=9.1900, cuisine="japanese")
+
+    body = captured[0]["body"]
+    assert body["includedType"] == "japanese_restaurant"
+    assert body["textQuery"] == "japanese restaurant"
+    assert body["strictTypeFiltering"] is True
+
+
+def test_geocode_returns_first_match(monkeypatch):
+    captured = _install_pages(monkeypatch, [{"places": [{
+        "location": {"latitude": 45.4719, "longitude": 9.1881},
+        "formattedAddress": "Via Brera, 10, 20121 Milano MI, Italy",
+    }]}])
+
+    result = places_client.geocode("Via Brera 10")
+
+    assert result == {"lat": 45.4719, "lon": 9.1881,
+                      "address": "Via Brera, 10, 20121 Milano MI, Italy"}
+    body = captured[0]["body"]
+    assert body["textQuery"] == "Via Brera 10"
+    assert body["pageSize"] == 1
+    # Biased toward the configured city (Milan by default).
+    assert body["locationBias"]["circle"]["center"] == {"latitude": 45.4642, "longitude": 9.19}
+    # Only location fields - no rating fields, which bill at a pricier tier.
+    assert "rating" not in captured[0]["headers"]["X-Goog-FieldMask"]
+
+
+def test_geocode_returns_none_when_nothing_matches(monkeypatch):
+    _install_pages(monkeypatch, [{}])
+
+    assert places_client.geocode("zzzz nowhere") is None
+
+
+def test_geocode_raises_on_error_status(monkeypatch):
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _FakeResponse(403, {"error": "permission denied"})
+
+    monkeypatch.setattr(places_client.requests, "post", fake_post)
+
+    with pytest.raises(places_client.PlacesAPIError):
+        places_client.geocode("Duomo")
 
 
 def test_search_restaurants_builds_text_search_request(monkeypatch):

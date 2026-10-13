@@ -50,7 +50,8 @@ def refresh_all_areas() -> None:
     refreshed, failed = 0, 0
     for area in areas:
         try:
-            places = service.fetch_and_store_area(area["center_lat"], area["center_lon"])
+            places = service.fetch_and_store_area(area["center_lat"], area["center_lon"],
+                                                  area.get("cuisine"))
         except places_client.PlacesAPIError:
             logger.exception("Places search failed for area %s", area["key"])
             failed += 1

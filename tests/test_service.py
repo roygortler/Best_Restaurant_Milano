@@ -43,9 +43,10 @@ class FakeDB:
         for place in places:
             self.places[place["place_id"]] = {"place": dict(place), "last_updated": time.time()}
 
-    def upsert_area(self, area_key, center_lat, center_lon, place_ids):
+    def upsert_area(self, area_key, center_lat, center_lon, place_ids, cuisine=None):
         self.areas[area_key] = {"place_ids": list(place_ids), "center_lat": center_lat,
-                                "center_lon": center_lon, "last_updated": time.time()}
+                                "center_lon": center_lon, "cuisine": cuisine,
+                                "last_updated": time.time()}
 
 
 @pytest.fixture(autouse=True)
@@ -63,8 +64,8 @@ def _install_fake_search(monkeypatch) -> list:
     """Replace search_restaurants with a fake; returns a list that records each call."""
     calls = []
 
-    def fake_search_restaurants(lat, lon):
-        calls.append((lat, lon))
+    def fake_search_restaurants(lat, lon, cuisine=None):
+        calls.append((lat, lon, cuisine))
         return [dict(p) for p in _FAKE_PLACES]
 
     monkeypatch.setattr(places_client, "search_restaurants", fake_search_restaurants)
@@ -104,7 +105,7 @@ def test_cache_miss_calls_api_and_fills_both_stores(monkeypatch, fake_stores):
 
 
 def test_no_restaurants_found_returns_empty_list(monkeypatch):
-    monkeypatch.setattr(places_client, "search_restaurants", lambda lat, lon: [])
+    monkeypatch.setattr(places_client, "search_restaurants", lambda lat, lon, cuisine=None: [])
 
     assert service.find_best_restaurants(USER_LAT, USER_LON) == []
 
@@ -244,7 +245,7 @@ def test_both_stores_down_still_answers_from_api(monkeypatch):
 
 
 def test_places_api_error_propagates(monkeypatch):
-    def failing_search(lat, lon):
+    def failing_search(lat, lon, cuisine=None):
         raise places_client.PlacesAPIError("quota exceeded")
 
     monkeypatch.setattr(places_client, "search_restaurants", failing_search)
@@ -325,7 +326,7 @@ def _place(place_id: str, rating: float, meters_north: float) -> dict:
 
 
 def _install_search_returning(monkeypatch, places: list[dict]):
-    monkeypatch.setattr(places_client, "search_restaurants", lambda lat, lon: [dict(p) for p in places])
+    monkeypatch.setattr(places_client, "search_restaurants", lambda lat, lon, cuisine=None: [dict(p) for p in places])
 
 
 def test_dense_area_drops_low_rated_and_far_places(monkeypatch):
@@ -365,3 +366,48 @@ def test_dense_area_scores_distance_against_the_tighter_limit(monkeypatch):
 
     assert seen["max_distance_km"] == get_settings().dense_max_distance_m / 1000
     assert results[0].normalized_distance == pytest.approx(0.0, abs=0.01)
+
+
+# --- Cuisines ------------------------------------------------------------
+
+def test_cuisine_is_passed_to_the_search(monkeypatch):
+    calls = _install_fake_search(monkeypatch)
+
+    service.find_best_restaurants(USER_LAT, USER_LON, cuisine="japanese")
+
+    assert calls == [(USER_LAT, USER_LON, "japanese")]
+
+
+def test_each_cuisine_is_cached_separately(monkeypatch, fake_stores):
+    calls = _install_fake_search(monkeypatch)
+
+    service.find_best_restaurants(USER_LAT, USER_LON)                     # all
+    service.find_best_restaurants(USER_LAT, USER_LON, cuisine="japanese")  # new search
+    service.find_best_restaurants(USER_LAT, USER_LON, cuisine="japanese")  # cached
+    service.find_best_restaurants(USER_LAT, USER_LON)                     # cached
+
+    assert [c[2] for c in calls] == [None, "japanese"]
+    assert cache.get_cached_area(USER_LAT, USER_LON, "japanese") == ["near-ok", "far-great"]
+    japanese_key = cache.area_bucket_key(USER_LAT, USER_LON, "japanese")
+    assert fake_stores.get_area(japanese_key)["cuisine"] == "japanese"
+
+
+def test_cuisine_area_served_from_postgres_after_redis_wipe(monkeypatch):
+    calls = _install_fake_search(monkeypatch)
+    service.find_best_restaurants(USER_LAT, USER_LON, cuisine="pizza")
+
+    cache.get_client().flushall()
+    results = service.find_best_restaurants(USER_LAT, USER_LON, cuisine="pizza")
+
+    assert len(calls) == 1
+    assert len(results) == 2
+    assert cache.get_cached_area(USER_LAT, USER_LON, "pizza") is not None
+
+
+def test_primary_type_reaches_the_ranked_results(monkeypatch):
+    places = [{**_place("pizzeria", 4.6, 100), "primary_type": "pizza_restaurant"}]
+    _install_search_returning(monkeypatch, places)
+
+    results = service.find_best_restaurants(USER_LAT, USER_LON)
+
+    assert results[0].primary_type == "pizza_restaurant"

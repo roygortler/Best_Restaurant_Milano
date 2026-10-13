@@ -34,7 +34,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 _PLACE = {"place_id": "p1", "name": "Trattoria", "rating": 4.5,
-          "user_rating_count": 300, "lat": 45.4645, "lon": 9.1902}
+          "user_rating_count": 300, "lat": 45.4645, "lon": 9.1902,
+          "primary_type": "italian_restaurant"}
 
 
 @pytest.fixture(autouse=True)
@@ -126,3 +127,21 @@ def test_all_areas_includes_stale_ones():
     keys = {area["key"] for area in db.all_areas()}
 
     assert keys == {"area:1:2", "area:3:4"}
+
+
+def test_place_without_primary_type_key_is_stored():
+    # Places cached in Redis before primary_type existed lack the key.
+    old_style = {k: v for k, v in _PLACE.items() if k != "primary_type"}
+
+    db.upsert_places([old_style])
+
+    assert db.get_places(["p1"])["p1"]["place"]["primary_type"] is None
+
+
+def test_area_cuisine_round_trip():
+    db.upsert_area("area:1:2:sushi", 45.46, 9.19, ["s1"], cuisine="sushi")
+    db.upsert_area("area:1:2", 45.46, 9.19, ["p1"])
+
+    cuisines = {a["key"]: a["cuisine"] for a in db.all_areas()}
+
+    assert cuisines == {"area:1:2:sushi": "sushi", "area:1:2": None}

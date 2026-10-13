@@ -83,3 +83,30 @@ def test_all_cached_areas_returns_center_coords_for_refresh_job():
     assert len(areas) == 2
     for area in areas:
         assert "center_lat" in area and "center_lon" in area
+
+
+def test_each_cuisine_gets_its_own_area_key():
+    all_key = cache.area_bucket_key(45.4642, 9.1900)
+    japanese_key = cache.area_bucket_key(45.4642, 9.1900, "japanese")
+
+    assert japanese_key == f"{all_key}:japanese"
+    assert japanese_key != cache.area_bucket_key(45.4642, 9.1900, "pizza")
+
+
+def test_cuisine_areas_are_cached_separately():
+    cache.set_cached_area(45.4642, 9.1900, ["p1", "p2"])
+    cache.set_cached_area(45.4642, 9.1900, ["sushi1"], cuisine="sushi")
+
+    assert cache.get_cached_area(45.4642, 9.1900) == ["p1", "p2"]
+    assert cache.get_cached_area(45.4642, 9.1900, "sushi") == ["sushi1"]
+    assert cache.get_cached_area(45.4642, 9.1900, "pizza") is None
+
+
+def test_all_cached_areas_reports_each_areas_cuisine():
+    # The refresh job needs it to re-run the same kind of search.
+    cache.set_cached_area(45.4642, 9.1900, ["p1"])
+    cache.set_cached_area(45.4642, 9.1900, ["s1"], cuisine="sushi")
+
+    cuisines = {a["key"]: a["cuisine"] for a in cache.all_cached_areas()}
+
+    assert sorted(cuisines.values(), key=str) == [None, "sushi"]
